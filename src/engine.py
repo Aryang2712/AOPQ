@@ -1,9 +1,9 @@
 """
-Adaptive Online Product Quantization (AO-PQ) Engine - v4.4 Core
+Adaptive Online Product Quantization (AO-PQ) Engine - v4.5 Core
 ===============================================================
 Features:
-- Zero-Reconstruction Out-of-Line Codebook Morphing via O(m * K^2) Nearest Centroid Projection.
-- Tiered Storage: Pure Compressed Mode (enable_reranking=False, 90.3% RAM savings) vs Two-Stage Refinement.
+- Dual-Mode Memory Accounting (Mode A: Standalone PQ Index vs. Mode B: Two-Stage Hybrid).
+- True O(m * K^2) Nearest-Centroid Discrete Morphing (Zero vector decoding).
 - Multi-Version Concurrency Control (MVCC) Generation Manager.
 - Dynamic Candidate Pool Scaling (alpha * N).
 - Generational Staleness Tracking & Bounded Compaction Debt.
@@ -23,7 +23,7 @@ from numba import njit
 from sklearn.cluster import MiniBatchKMeans
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from src.storage import ChunkedVectorStorage, ImmutableChunk
+from src.storage import ChunkedVectorStorage, ImmutableChunk, compute_centroid_transition_map
 
 
 @njit(fastmath=True, nogil=True)
@@ -189,7 +189,8 @@ class AdaptiveOnlinePQ:
         max_active_window: int = 4,
         chunk_capacity: int = 32768,
         initial_arena_capacity: int = 131072,
-        enable_reranking: bool = True
+        enable_raw_cache: bool = True,
+        enable_reranking: Optional[bool] = None
     ):
         assert d % m == 0, f"Vector dimension {d} must be divisible by m={m}"
         self.d = d
@@ -199,7 +200,9 @@ class AdaptiveOnlinePQ:
         self.lr = lr
         self.momentum = momentum
         self.drift_threshold = drift_threshold
-        self.enable_reranking = enable_reranking
+        if enable_reranking is not None:
+            enable_raw_cache = enable_reranking
+        self.enable_raw_cache = enable_raw_cache
 
         self.epoch_manager = EpochManager(max_active_window=max_active_window)
         self.storage = ChunkedVectorStorage(
@@ -287,7 +290,7 @@ class AdaptiveOnlinePQ:
         X_sub = self._decompose(X_batch)
         N_batch = X_batch.shape[0]
 
-        # 1. Stochastic Centroid Tracking
+        # 1. Update Shadow Centroids
         for i in range(self.m):
             sub_vecs = X_sub[:, i, :]
             centroids = self.shadow_codebook[i]
@@ -333,13 +336,13 @@ class AdaptiveOnlinePQ:
             for cand in candidates:
                 self.migration_queue.put(cand)
 
-        # 4. Ingest raw vectors for second-stage refinement (if enabled)
-        if self.enable_reranking:
+        # 4. Optional Ingest of raw vectors for two-stage refinement cache
+        if self.enable_raw_cache:
             with self._raw_lock:
                 self._raw_chunks.append(np.ascontiguousarray(X_batch, dtype=np.float32))
                 self._raw_count += N_batch
 
-        # 5. Append to Storage Arena
+        # 5. Storage Append
         active_id = self.epoch_manager.active_epoch_id
         active_snap = self.epoch_manager.registry[active_id]
 
@@ -371,6 +374,7 @@ class AdaptiveOnlinePQ:
             target_epoch_id = self.epoch_manager.active_epoch_id
             target_snapshot = self.epoch_manager.registry[target_epoch_id]
 
+        # Zero-reconstruction discrete morphing
         migrated_total = self.storage.migrate_all_records(
             old_epoch_id=old_epoch_id,
             target_epoch_id=target_epoch_id,
@@ -384,6 +388,7 @@ class AdaptiveOnlinePQ:
         self.total_compactions += 1
 
     def search_adc_only(self, query: np.ndarray, top_k: int = 10) -> Tuple[np.ndarray, np.ndarray]:
+        """Mode A: Pure Asymmetric Distance Computation (Zero raw cache lookup)."""
         assert query.shape[0] == self.d, f"Query dimension mismatch: expected {self.d}"
         q_sub = query.reshape(self.m, self.d_sub)
 
@@ -438,9 +443,7 @@ class AdaptiveOnlinePQ:
         candidate_pool: Optional[int] = None,
         candidate_ratio: float = 0.005
     ) -> Tuple[np.ndarray, np.ndarray]:
-        if not self.enable_reranking:
-            return self.search_adc_only(query, top_k=top_k)
-
+        """Mode B: Two-stage search with dynamic candidate pool scaling and exact reranking."""
         assert query.shape[0] == self.d, f"Query dimension mismatch: expected {self.d}"
         q_sub = query.reshape(self.m, self.d_sub)
 
@@ -485,16 +488,18 @@ class AdaptiveOnlinePQ:
         candidate_indices = np.argpartition(all_dists, candidate_k - 1)[:candidate_k]
         candidate_ids = flat_gids[candidate_indices]
 
-        with self._raw_lock:
-            if candidate_ids.size > 0 and candidate_ids.max() < self._raw_count:
-                candidate_vecs = np.vstack([self._get_raw_vector(int(cid)) for cid in candidate_ids])
-                exact_dists = _fast_exact_rerank(candidate_vecs, query)
+        # Rerank using raw cache if enabled
+        if self.enable_raw_cache:
+            with self._raw_lock:
+                if candidate_ids.size > 0 and candidate_ids.max() < self._raw_count:
+                    candidate_vecs = np.vstack([self._get_raw_vector(int(cid)) for cid in candidate_ids])
+                    exact_dists = _fast_exact_rerank(candidate_vecs, query)
 
-                final_k = min(top_k, candidate_k)
-                best_local = np.argpartition(exact_dists, final_k - 1)[:final_k]
-                sorted_order = best_local[np.argsort(exact_dists[best_local])]
+                    final_k = min(top_k, candidate_k)
+                    best_local = np.argpartition(exact_dists, final_k - 1)[:final_k]
+                    sorted_order = best_local[np.argsort(exact_dists[best_local])]
 
-                return candidate_ids[sorted_order], exact_dists[sorted_order]
+                    return candidate_ids[sorted_order], exact_dists[sorted_order]
 
         final_k = min(top_k, candidate_k)
         sorted_order = candidate_indices[np.argsort(all_dists[candidate_indices])][:final_k]
@@ -523,6 +528,11 @@ class AdaptiveOnlinePQ:
         }
 
     def get_memory_footprint(self) -> dict:
+        """
+        Calculates physical memory consumption under two deployment modes:
+        - Mode A (Standalone PQ Index): Codes, epochs, chunk metadata, and codebooks.
+        - Mode B (Two-Stage Hybrid): Mode A index + full-precision uncompressed raw cache.
+        """
         with self.storage.lock:
             code_bytes = self.storage._flat_codes.nbytes
             epoch_bytes = self.storage._flat_epochs.nbytes
@@ -539,24 +549,34 @@ class AdaptiveOnlinePQ:
         with self._raw_lock:
             raw_bytes = sum(chunk.nbytes for chunk in self._raw_chunks)
 
-        total_pq_index_bytes = code_bytes + epoch_bytes + gid_bytes + chunk_overhead + codebook_bytes
-        total_system_bytes = total_pq_index_bytes + raw_bytes
+        mode_a_index_bytes = code_bytes + epoch_bytes + gid_bytes + chunk_overhead + codebook_bytes
+        mode_b_total_bytes = mode_a_index_bytes + raw_bytes
         flat_uncompressed_bytes = self.storage.total_records * self.d * 4
+
+        ratio_a = (
+            (1.0 - (mode_a_index_bytes / max(flat_uncompressed_bytes, 1))) * 100.0
+            if flat_uncompressed_bytes > 0 else 0.0
+        )
+        savings_b = (
+            (1.0 - (mode_b_total_bytes / max(flat_uncompressed_bytes, 1))) * 100.0
+            if flat_uncompressed_bytes > 0 else 0.0
+        )
 
         return {
             "total_records": self.storage.total_records,
-            "pq_index_bytes": total_pq_index_bytes,
+            # Mode A & B explicit keys
+            "mode_a_index_bytes": mode_a_index_bytes,
+            "mode_b_raw_cache_bytes": raw_bytes,
+            "mode_b_total_allocated_bytes": mode_b_total_bytes,
+            "mode_a_standalone_compression_ratio": ratio_a,
+            "mode_b_system_savings": savings_b,
+            # Standard backward-compatible keys
+            "pq_index_bytes": mode_a_index_bytes,
             "raw_cache_bytes": raw_bytes,
-            "total_allocated_bytes": total_system_bytes,
+            "total_allocated_bytes": mode_b_total_bytes,
             "equivalent_flat_bytes": flat_uncompressed_bytes,
-            "pq_standalone_compression_ratio": (
-                (1.0 - (total_pq_index_bytes / max(flat_uncompressed_bytes, 1))) * 100.0
-                if flat_uncompressed_bytes > 0 else 0.0
-            ),
-            "effective_system_savings": (
-                (1.0 - (total_system_bytes / max(flat_uncompressed_bytes, 1))) * 100.0
-                if flat_uncompressed_bytes > 0 else 0.0
-            )
+            "pq_standalone_compression_ratio": ratio_a,
+            "effective_system_savings": savings_b
         }
 
     def close(self):

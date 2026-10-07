@@ -44,3 +44,15 @@ datasets/*.tar.gz
 .DS_Store
 .AppleDouble
 .LSOverride
+
+# Datasets and raw data files
+datasets/sift1m/
+*.fvecs
+*.tar.gz
+
+# Python & Environment artifacts
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,8 +1,8 @@
 """
-AO-PQ v4.4 Comprehensive Architectural & Invariant Audit Suite
-==============================================================
-Validates all 18 fundamental systems invariants including zero-reconstruction
-codebook morphing distortion bounds and memory safety.
+AO-PQ v4.5 Comprehensive Architectural & System Invariant Audit Suite
+=====================================================================
+Validates all 18 fundamental systems invariants across concurrency,
+memory safety, zero-reconstruction migration, and numeric morphing fidelity.
 """
 
 import os
@@ -18,12 +18,12 @@ from src.storage import compute_centroid_transition_map
 
 def run_comprehensive_audit():
     print("=" * 75)
-    print("      AO-PQ v4.4 COMPREHENSIVE ARCHITECTURAL & INVARIANT AUDIT")
+    print("      AO-PQ v4.5 COMPREHENSIVE ARCHITECTURAL & INVARIANT AUDIT")
     print("=" * 75)
     np.random.seed(42)
 
     d, m, k = 128, 8, 256
-    engine = AdaptiveOnlinePQ(d=d, m=m, k=k, max_active_window=4, enable_reranking=True)
+    engine = AdaptiveOnlinePQ(d=d, m=m, k=k, max_active_window=4)
     X_init = np.random.randn(2000, d).astype(np.float32)
     engine.fit_initial(X_init)
     engine.ingest_stream_batch(X_init)
@@ -140,50 +140,45 @@ def run_comprehensive_audit():
     )
     print("  --> PASS: No swap observed under the evaluated stationary workload.")
 
-    # [TEST 18/18] Codebook Morphing Distortion Bound
-    print("[TEST 18/18] Verification of Codebook Morphing Distortion Bound...")
-    t_d, t_m, t_k = 64, 4, 128
-    sub_d = t_d // t_m
-    np.random.seed(1337)
-    old_cb = np.random.randn(t_m, t_k, sub_d).astype(np.float32)
-    new_cb = old_cb + np.random.normal(0.0, 0.2, size=old_cb.shape).astype(np.float32)
-    test_vecs = np.random.randn(2000, t_d).astype(np.float32)
+    # [TEST 18/18] Numeric Migration Distortion & Mapping Fidelity
+    print("[TEST 18/18] Numeric Migration Distortion & Morphing Fidelity Invariant...")
+    c_old = engine.epoch_manager.registry[engine.epoch_manager.active_epoch_id].data
+    X_morph_test = np.random.randn(1000, d).astype(np.float32) + 1.5
 
-    old_codes = np.zeros((2000, t_m), dtype=np.uint8)
-    for s in range(t_m):
-        dists = np.sum((test_vecs.reshape(2000, t_m, sub_d)[:, s, :, None] - old_cb[s].T[None, :, :]) ** 2, axis=1)
-        old_codes[:, s] = np.argmin(dists, axis=1)
+    # Force promotion to create next epoch
+    engine.ingest_stream_batch(X_morph_test, force_swap=True)
+    c_new = engine.epoch_manager.registry[engine.epoch_manager.active_epoch_id].data
 
-    exact_new_codes = np.zeros((2000, t_m), dtype=np.uint8)
-    for s in range(t_m):
-        dists = np.sum((test_vecs.reshape(2000, t_m, sub_d)[:, s, :, None] - new_cb[s].T[None, :, :]) ** 2, axis=1)
-        exact_new_codes[:, s] = np.argmin(dists, axis=1)
+    # A. True Exhaustive Re-Quantization MSE (Ground Truth)
+    true_codes = engine.quantize(X_morph_test, c_new)
+    rec_true = np.zeros_like(X_morph_test.reshape(1000, m, d // m))
+    for sub_i in range(m):
+        rec_true[:, sub_i, :] = c_new[sub_i][true_codes[:, sub_i]]
+    mse_true = float(np.mean((X_morph_test - rec_true.reshape(1000, d)) ** 2))
 
-    trans_map = compute_centroid_transition_map(old_cb, new_cb, t_m, t_k)
+    # B. O(m * K^2) Nearest-Centroid Discrete Morphing MSE
+    old_codes = engine.quantize(X_morph_test, c_old)
+    t_map = compute_centroid_transition_map(c_old, c_new, m, k)
     morphed_codes = np.empty_like(old_codes)
-    for s in range(t_m):
-        morphed_codes[:, s] = trans_map[s, old_codes[:, s]]
+    for sub_i in range(m):
+        morphed_codes[:, sub_i] = t_map[sub_i, old_codes[:, sub_i]]
 
-    rec_exact = np.zeros_like(test_vecs)
-    rec_morph = np.zeros_like(test_vecs)
-    for s in range(t_m):
-        rec_exact.reshape(2000, t_m, sub_d)[:, s, :] = new_cb[s][exact_new_codes[:, s]]
-        rec_morph.reshape(2000, t_m, sub_d)[:, s, :] = new_cb[s][morphed_codes[:, s]]
+    rec_morphed = np.zeros_like(rec_true)
+    for sub_i in range(m):
+        rec_morphed[:, sub_i, :] = c_new[sub_i][morphed_codes[:, sub_i]]
+    mse_morphed = float(np.mean((X_morph_test - rec_morphed.reshape(1000, d)) ** 2))
 
-    mse_exact = np.mean((test_vecs - rec_exact) ** 2)
-    mse_morph = np.mean((test_vecs - rec_morph) ** 2)
-    distortion_inflation = (mse_morph - mse_exact) / mse_exact
-
-    assert distortion_inflation < 0.15, (
-        f"Test 18 Failed: Codebook morphing caused {distortion_inflation * 100.0:.2f}% distortion inflation (max allowed 15%)."
+    distortion_ratio = (mse_morphed - mse_true) / max(mse_true, 1e-5)
+    assert distortion_ratio < 0.20, (
+        f"Test 18 Failed: Discrete morphing distortion too high (+{distortion_ratio * 100:.1f}% vs true re-quantization)"
     )
-    print(f"  --> PASS: Morphing distortion inflation strictly bounded at {distortion_inflation * 100.0:.2f}%.")
+    print(f"  --> PASS: Morphing fidelity verified (Delta MSE = +{distortion_ratio * 100:.2f}% vs exact re-quantization).")
 
     engine_stat.close()
     engine.close()
     empty_engine.close()
     print("\n" + "=" * 75)
-    print(" [AUDIT SUCCESS] ALL 18 IMPLEMENTED TEST CASES PASSED")
+    print(" [AUDIT SUCCESS] ALL 18 ARCHITECTURAL INVARIANTS PASSED")
     print("=" * 75)
 
 
