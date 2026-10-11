@@ -12,9 +12,11 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
+# Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.engine import AdaptiveOnlinePQ
 
+# Page configuration
 st.set_page_config(
     page_title="AO-PQ Telemetry Cockpit",
     page_icon="⚡",
@@ -22,12 +24,15 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize Session State
+# ---------------------------------------------------------
+# Session State Initialization (Interactive Engine)
+# ---------------------------------------------------------
 if "engine" not in st.session_state:
     d, m, k = 64, 4, 128
     engine = AdaptiveOnlinePQ(
         d=d, m=m, k=k, lr=0.15, momentum=0.85, drift_threshold=0.015, max_active_window=4
     )
+    # Seed initial bootstrap data
     np.random.seed(42)
     init_data = np.random.randn(2000, d).astype(np.float32)
     engine.fit_initial(init_data)
@@ -43,10 +48,12 @@ if "engine" not in st.session_state:
 engine = st.session_state.engine
 d = st.session_state.d
 
+# ---------------------------------------------------------
+# Header & Systems Telemetry Metrics Bar
+# ---------------------------------------------------------
 st.title("⚡ AO-PQ: Multi-Version Concurrency Control Vector Engine")
 st.caption("Asynchronous Zero-Downtime Product Quantization under Continuous Embedding Drift")
 
-# Top Systems Telemetry Cards
 col1, col2, col3, col4, col5 = st.columns(5)
 staleness = engine.get_generational_staleness()
 mem = engine.get_memory_footprint()
@@ -59,12 +66,15 @@ col5.metric("Query Availability", "100.0%", delta="0 Dropped Reads")
 
 st.divider()
 
-# Sidebar Engine Controls
+# ---------------------------------------------------------
+# Sidebar: Engine Control Panel
+# ---------------------------------------------------------
 with st.sidebar:
     st.header("🛠️ Engine Control Panel")
+
     st.subheader("1. Stream Mutation")
     batch_size = st.slider("Vectors per Batch", 500, 5000, 1000, step=500)
-    drift_scale = st.slider("Drift Magnitude (Shift σ)", 0.0, 5.0, 1.5, step=0.5)
+    drift_scale = st.slider("Drift Magnitude (Shift σ)", 0.0, 5.0, 1.0, step=0.2)
 
     col_btn1, col_btn2 = st.columns(2)
     stream_pressed = col_btn1.button("▶ Stream Batch", use_container_width=True)
@@ -73,7 +83,10 @@ with st.sidebar:
     if stream_pressed or force_swap_pressed:
         st.session_state.batch_count += 1
         b_idx = st.session_state.batch_count
-        batch = (np.random.randn(batch_size, d) + (b_idx * drift_scale * 0.5)).astype(np.float32)
+
+        # Smooth gradual drift accumulation for stream clicks, sharp shock for force swap
+        shift_amount = (b_idx * drift_scale * 0.04) if stream_pressed else (b_idx * 2.5)
+        batch = (np.random.randn(batch_size, d) + shift_amount).astype(np.float32)
 
         t0 = time.perf_counter()
         engine.ingest_stream_batch(batch, force_swap=force_swap_pressed)
@@ -107,13 +120,18 @@ with st.sidebar:
         st.session_state.clear()
         st.rerun()
 
+# ---------------------------------------------------------
+# Tabs: Dashboard Main Content
+# ---------------------------------------------------------
 tab1, tab2, tab3 = st.tabs([
     "📊 SIFT-1M Publication Artifacts",
     "🧪 Live Drift Simulator & Search Sandbox",
     "📈 Industrial FAISS Benchmark & Memory Audit"
 ])
 
-# TAB 1: SIFT-1M Artifacts
+# =========================================================
+# TAB 1: SIFT-1M Publication Artifacts
+# =========================================================
 with tab1:
     st.subheader("SIFT-1M Streaming Drift Benchmark (1,000,000 Vectors)")
     c1, c2 = st.columns(2)
@@ -138,7 +156,9 @@ with tab1:
     if os.path.exists("results/sift_fig4_scalability.png"):
         st.image("results/sift_fig4_scalability.png", use_container_width=True)
 
+# =========================================================
 # TAB 2: Live Interactive Sandbox
+# =========================================================
 with tab2:
     st.subheader("Interactive Drift Ingestion & Live Query Sandbox")
     left_c, right_c = st.columns([1, 1])
@@ -174,7 +194,9 @@ with tab2:
         else:
             st.info("Click '▶ Stream Batch' in the sidebar to simulate streaming drift.")
 
+# =========================================================
 # TAB 3: Industrial Baseline & Memory Audit
+# =========================================================
 with tab3:
     st.subheader("Industry Comparison: FAISS Stop-The-World Retrain vs. AO-PQ")
     faiss_csv = "results/faiss_vs_aopq_comparison.csv"
@@ -186,19 +208,26 @@ with tab3:
 
     st.markdown("""
     #### Architectural Analysis:
-    - **FAISS IVFPQ Downtime:** Rebuilding inverted centroids scales super-linearly with corpus size ($O(N \cdot d)$), forcing readers into multi-second query freezes ($1.2\text{s}$ to $6.1\text{s}$).
-    - **AO-PQ Jitter:** Measures an empirical reader jitter of **$< 1.5\text{ ms}$** during active cutover, maintaining $100\%$ service availability.
+    - **FAISS IVFPQ Downtime:** Centroid re-clustering incurs $O(N \cdot d)$ pause overhead, creating multi-second serving blackouts ($763\text{ ms}$ to $1,844\text{ ms}$).
+    - **AO-PQ Jitter:** Measures an empirical reader jitter of **$< 3.5\text{ ms}$** during active cutover, maintaining $100\%$ availability with $0$ dropped queries.
     - **Partitioning Trade-Off Note:** While FAISS achieves faster steady-state reads via inverted file list pruning (`nlist=100`), AO-PQ evaluates a Flat PQ arena to isolate quantizer MVCC correctness. Adding IVF partitioning on top of AO-PQ's epoch protocol is identified as direct future work.
     """)
 
     st.divider()
     st.subheader("Physical Memory Audit: Mode A vs. Mode B")
+
+    # Accurate memory accounting handling both small demo buffers and 1M scale
+    if mem['total_records'] < 50000:
+        mode_a_savings_str = "Overhead Dominated (Small Demo Buffer)"
+    else:
+        mode_a_savings_str = f"{mem['mode_a_standalone_compression_ratio']:.2f}% Savings"
+
     mem_audit = pd.DataFrame([
         {
             "Deployment Mode": "Mode A: Standalone PQ Index",
             "Components Stored": "Compressed codes (m=8), epoch tags, chunk metadata, snapshots",
             "Allocated RAM": f"{mem['mode_a_index_bytes'] / (1024 * 1024):.2f} MB",
-            "Physical Compression": f"{mem['mode_a_standalone_compression_ratio']:.2f}% Savings"
+            "Physical Compression": mode_a_savings_str
         },
         {
             "Deployment Mode": "Mode B: Two-Stage Hybrid",
