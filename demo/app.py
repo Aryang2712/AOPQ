@@ -28,7 +28,7 @@ st.set_page_config(
 if "engine" not in st.session_state:
     d, m, k = 64, 4, 128
     engine = AdaptiveOnlinePQ(
-        d=d, m=m, k=k, lr=0.15, momentum=0.85, drift_threshold=0.015, max_active_window=4
+        d=d, m=m, k=k, lr=0.15, momentum=0.85, drift_threshold=0.015, max_active_window=4, enable_raw_cache=True
     )
     np.random.seed(42)
     init_data = np.random.randn(2000, d).astype(np.float32)
@@ -84,8 +84,8 @@ with st.sidebar:
     drift_scale = st.slider("Drift Magnitude (Shift σ)", 0.0, 5.0, 1.0, step=0.2)
 
     col_btn1, col_btn2 = st.columns(2)
-    stream_pressed = col_btn1.button("▶ Stream Batch", use_container_width=True)
-    force_swap_pressed = col_btn2.button("⚡ Force Swap", use_container_width=True)
+    stream_pressed = col_btn1.button("▶ Stream Batch", width="stretch")
+    force_swap_pressed = col_btn2.button("⚡ Force Swap", width="stretch")
 
     if stream_pressed or force_swap_pressed:
         st.session_state.batch_count += 1
@@ -128,7 +128,7 @@ with st.sidebar:
     - **Compaction:** $O(m \\cdot K^2)$ Discrete Projection
     """)
 
-    if st.button("🔄 Reset In-Memory Engine", use_container_width=True):
+    if st.button("🔄 Reset In-Memory Engine", width="stretch"):
         st.session_state.clear()
         st.rerun()
 
@@ -148,23 +148,23 @@ with tab1:
     with c1:
         st.markdown("**Figure 1: Reconstruction Error (MSE) under Drift**")
         if os.path.exists("results/sift_fig1_reconstruction_mse.png"):
-            st.image("results/sift_fig1_reconstruction_mse.png", use_container_width=True)
+            st.image("results/sift_fig1_reconstruction_mse.png", width="stretch")
         st.markdown("**Figure 3: Pure ADC Query Latency Distribution**")
         if os.path.exists("results/sift_fig3_latency_distribution.png"):
-            st.image("results/sift_fig3_latency_distribution.png", use_container_width=True)
+            st.image("results/sift_fig3_latency_distribution.png", width="stretch")
 
     with c2:
         st.markdown("**Figure 2: Empirical Recall@10 Retention**")
         if os.path.exists("results/sift_fig2_recall_retention.png"):
-            st.image("results/sift_fig2_recall_retention.png", use_container_width=True)
+            st.image("results/sift_fig2_recall_retention.png", width="stretch")
         st.markdown("**Figure 5: Bounded Generational Staleness (W = 4)**")
         if os.path.exists("results/sift_fig5_generational_staleness.png"):
-            st.image("results/sift_fig5_generational_staleness.png", use_container_width=True)
+            st.image("results/sift_fig5_generational_staleness.png", width="stretch")
 
     st.markdown("---")
     st.markdown("**Figure 4: Single-Pass Multi-Epoch ADC Latency Scaling**")
     if os.path.exists("results/sift_fig4_scalability.png"):
-        st.image("results/sift_fig4_scalability.png", use_container_width=True)
+        st.image("results/sift_fig4_scalability.png", width="stretch")
 
 # TAB 2: Live Interactive Sandbox
 with tab2:
@@ -173,12 +173,17 @@ with tab2:
 
     with left_c:
         st.markdown("#### Test Real-Time Query Serving")
+        search_mode = st.radio("Search Mode", ["Mode B: Two-Stage (Exact Rerank)", "Mode A: Pure ADC (Quantized Scan)"])
         top_k = st.slider("Top-K Neighbors", 5, 50, 10)
-        if st.button("🔍 Dispatch Random Live Search", use_container_width=True):
+
+        if st.button("🔍 Dispatch Random Live Search", width="stretch"):
             test_q = np.random.randn(d).astype(np.float32)
             t_start = time.perf_counter()
             try:
-                top_ids, top_dists = engine.search(test_q, top_k=top_k)
+                if "Mode A" in search_mode:
+                    top_ids, top_dists = engine.search_adc_only(test_q, top_k=top_k)
+                else:
+                    top_ids, top_dists = engine.search(test_q, top_k=top_k)
                 assert len(top_ids) == top_k
                 st.session_state.total_live_queries += 1
                 t_elapsed = (time.perf_counter() - t_start) * 1000.0
@@ -187,7 +192,7 @@ with tab2:
                     "Rank": list(range(1, len(top_ids) + 1)),
                     "Vector Global ID": top_ids,
                     "Distance Metric": np.round(top_dists, 4)
-                }), use_container_width=True)
+                }), width="stretch")
             except Exception as e:
                 st.session_state.total_live_queries += 1
                 st.session_state.failed_live_queries += 1
@@ -197,7 +202,7 @@ with tab2:
         st.markdown("#### Real-Time Telemetry Log")
         if st.session_state.history:
             df_hist = pd.DataFrame(st.session_state.history)
-            st.dataframe(df_hist.tail(10), use_container_width=True)
+            st.dataframe(df_hist.tail(10), width="stretch")
             fig, ax = plt.subplots(figsize=(6, 2.5))
             ax.plot(df_hist["Batch"], df_hist["Query_Latency_ms"], marker="o", color="#0275d8")
             ax.set_title("Live Reader Latency Under Drift Ingestion (ms)", fontsize=9, fontweight="bold")
@@ -214,14 +219,14 @@ with tab3:
     faiss_csv = "results/faiss_vs_aopq_comparison.csv"
     if os.path.exists(faiss_csv):
         df_faiss = pd.read_csv(faiss_csv)
-        st.dataframe(df_faiss, use_container_width=True)
+        st.dataframe(df_faiss, width="stretch")
     else:
         st.warning("Run 'python benchmark/bench_faiss_ivfpq.py' to generate comparison metrics.")
 
     st.markdown("""
     #### Architectural Analysis:
-    - **FAISS STW Downtime:** In-place centroid retraining scales super-linearly ($O(N \\cdot d)$), forcing readers into multi-second query freezes ($763\\text{ ms}$ to $1,844\\text{ ms}$).
-    - **FAISS Blue-Green Baseline:** Rebuilding aside avoids downtime, but requires a $2.0\\times$ peak index RAM spike.
+    - **FAISS STW Downtime:** In-place centroid retraining scales super-linearly ($O(N \\cdot d)$), forcing readers into multi-second query freezes ($760\\text{ ms}$ to $1,900\\text{ ms}$).
+    - **FAISS Blue-Green Baseline:** Rebuilding aside avoids downtime, but requires a $2.0\\times$ peak index RAM spike and full $O(N \\cdot d)$ re-clustering.
     - **AO-PQ Cutover Jitter:** Empirical reader jitter stays bounded ($< 3.5\\text{ ms}$) with $0$ dropped queries.
     - **Partitioning Trade-Off:** While FAISS achieves faster steady-state reads via inverted file list pruning (`nlist=100`), AO-PQ evaluates a Flat PQ arena to isolate quantizer MVCC correctness. Applying epoch versioning to inverted lists (IVF-AO-PQ) is planned future work.
     """)
