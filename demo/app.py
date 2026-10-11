@@ -12,11 +12,9 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.engine import AdaptiveOnlinePQ
 
-# Page configuration
 st.set_page_config(
     page_title="AO-PQ Telemetry Cockpit",
     page_icon="⚡",
@@ -32,7 +30,6 @@ if "engine" not in st.session_state:
     engine = AdaptiveOnlinePQ(
         d=d, m=m, k=k, lr=0.15, momentum=0.85, drift_threshold=0.015, max_active_window=4
     )
-    # Seed initial bootstrap data
     np.random.seed(42)
     init_data = np.random.randn(2000, d).astype(np.float32)
     engine.fit_initial(init_data)
@@ -44,6 +41,8 @@ if "engine" not in st.session_state:
     st.session_state.k = k
     st.session_state.batch_count = 0
     st.session_state.history = []
+    st.session_state.total_live_queries = 0
+    st.session_state.failed_live_queries = 0
 
 engine = st.session_state.engine
 d = st.session_state.d
@@ -62,7 +61,15 @@ col1.metric("Indexed Records", f"{mem['total_records']:,}")
 col2.metric("Active Epoch", f"Generation {staleness['active_epoch']}")
 col3.metric("Codebook Swaps", f"{engine.total_swaps}")
 col4.metric("Window Staleness Lag", f"{staleness['max_epoch_lag']} Epochs", delta="Bounded by W=4")
-col5.metric("Query Availability", "100.0%", delta="0 Dropped Reads")
+
+total_q = st.session_state.total_live_queries
+failed_q = st.session_state.failed_live_queries
+avail_pct = 100.0 if total_q == 0 else ((total_q - failed_q) / total_q) * 100.0
+col5.metric(
+    "Query Availability",
+    f"{avail_pct:.1f}%",
+    delta=f"{failed_q} Dropped Reads ({total_q} Total)"
+)
 
 st.divider()
 
@@ -84,7 +91,6 @@ with st.sidebar:
         st.session_state.batch_count += 1
         b_idx = st.session_state.batch_count
 
-        # Smooth gradual drift accumulation for stream clicks, sharp shock for force swap
         shift_amount = (b_idx * drift_scale * 0.04) if stream_pressed else (b_idx * 2.5)
         batch = (np.random.randn(batch_size, d) + shift_amount).astype(np.float32)
 
@@ -94,7 +100,13 @@ with st.sidebar:
 
         sample_q = batch[0]
         t_q0 = time.perf_counter()
-        ids, dists = engine.search(sample_q, top_k=10)
+        try:
+            ids, dists = engine.search(sample_q, top_k=10)
+            assert len(ids) == 10
+            st.session_state.total_live_queries += 1
+        except Exception:
+            st.session_state.total_live_queries += 1
+            st.session_state.failed_live_queries += 1
         q_time = (time.perf_counter() - t_q0) * 1000.0
 
         st.session_state.history.append({
@@ -113,7 +125,7 @@ with st.sidebar:
     - **Subspaces ($m$):** `{st.session_state.m}`
     - **Centroids ($K$):** `{st.session_state.k}`
     - **Sliding Window ($W$):** `4 Epochs`
-    - **Compaction:** $O(m \cdot K^2)$ Discrete Projection
+    - **Compaction:** $O(m \\cdot K^2)$ Discrete Projection
     """)
 
     if st.button("🔄 Reset In-Memory Engine", use_container_width=True):
@@ -129,9 +141,7 @@ tab1, tab2, tab3 = st.tabs([
     "📈 Industrial FAISS Benchmark & Memory Audit"
 ])
 
-# =========================================================
 # TAB 1: SIFT-1M Publication Artifacts
-# =========================================================
 with tab1:
     st.subheader("SIFT-1M Streaming Drift Benchmark (1,000,000 Vectors)")
     c1, c2 = st.columns(2)
@@ -156,9 +166,7 @@ with tab1:
     if os.path.exists("results/sift_fig4_scalability.png"):
         st.image("results/sift_fig4_scalability.png", use_container_width=True)
 
-# =========================================================
 # TAB 2: Live Interactive Sandbox
-# =========================================================
 with tab2:
     st.subheader("Interactive Drift Ingestion & Live Query Sandbox")
     left_c, right_c = st.columns([1, 1])
@@ -169,15 +177,21 @@ with tab2:
         if st.button("🔍 Dispatch Random Live Search", use_container_width=True):
             test_q = np.random.randn(d).astype(np.float32)
             t_start = time.perf_counter()
-            top_ids, top_dists = engine.search(test_q, top_k=top_k)
-            t_elapsed = (time.perf_counter() - t_start) * 1000.0
-
-            st.success(f"Query returned in **{t_elapsed:.3f} ms** without queuing or lock contention.")
-            st.dataframe(pd.DataFrame({
-                "Rank": list(range(1, len(top_ids) + 1)),
-                "Vector Global ID": top_ids,
-                "Distance Metric": np.round(top_dists, 4)
-            }), use_container_width=True)
+            try:
+                top_ids, top_dists = engine.search(test_q, top_k=top_k)
+                assert len(top_ids) == top_k
+                st.session_state.total_live_queries += 1
+                t_elapsed = (time.perf_counter() - t_start) * 1000.0
+                st.success(f"Query returned in **{t_elapsed:.3f} ms** without lock contention.")
+                st.dataframe(pd.DataFrame({
+                    "Rank": list(range(1, len(top_ids) + 1)),
+                    "Vector Global ID": top_ids,
+                    "Distance Metric": np.round(top_dists, 4)
+                }), use_container_width=True)
+            except Exception as e:
+                st.session_state.total_live_queries += 1
+                st.session_state.failed_live_queries += 1
+                st.error(f"Query execution failed: {str(e)}")
 
     with right_c:
         st.markdown("#### Real-Time Telemetry Log")
@@ -194,29 +208,27 @@ with tab2:
         else:
             st.info("Click '▶ Stream Batch' in the sidebar to simulate streaming drift.")
 
-# =========================================================
 # TAB 3: Industrial Baseline & Memory Audit
-# =========================================================
 with tab3:
-    st.subheader("Industry Comparison: FAISS Stop-The-World Retrain vs. AO-PQ")
+    st.subheader("Industry Comparison: FAISS Retrain Baselines vs. AO-PQ")
     faiss_csv = "results/faiss_vs_aopq_comparison.csv"
     if os.path.exists(faiss_csv):
         df_faiss = pd.read_csv(faiss_csv)
         st.dataframe(df_faiss, use_container_width=True)
     else:
-        st.warning("Run 'python benchmark/bench_faiss_ivfpq.py' to generate multi-scale comparison metrics.")
+        st.warning("Run 'python benchmark/bench_faiss_ivfpq.py' to generate comparison metrics.")
 
     st.markdown("""
     #### Architectural Analysis:
-    - **FAISS IVFPQ Downtime:** Centroid re-clustering incurs $O(N \cdot d)$ pause overhead, creating multi-second serving blackouts ($763\text{ ms}$ to $1,844\text{ ms}$).
-    - **AO-PQ Jitter:** Measures an empirical reader jitter of **$< 3.5\text{ ms}$** during active cutover, maintaining $100\%$ availability with $0$ dropped queries.
-    - **Partitioning Trade-Off Note:** While FAISS achieves faster steady-state reads via inverted file list pruning (`nlist=100`), AO-PQ evaluates a Flat PQ arena to isolate quantizer MVCC correctness. Adding IVF partitioning on top of AO-PQ's epoch protocol is identified as direct future work.
+    - **FAISS STW Downtime:** In-place centroid retraining scales super-linearly ($O(N \\cdot d)$), forcing readers into multi-second query freezes ($763\\text{ ms}$ to $1,844\\text{ ms}$).
+    - **FAISS Blue-Green Baseline:** Rebuilding aside avoids downtime, but requires a $2.0\\times$ peak index RAM spike.
+    - **AO-PQ Cutover Jitter:** Empirical reader jitter stays bounded ($< 3.5\\text{ ms}$) with $0$ dropped queries.
+    - **Partitioning Trade-Off:** While FAISS achieves faster steady-state reads via inverted file list pruning (`nlist=100`), AO-PQ evaluates a Flat PQ arena to isolate quantizer MVCC correctness. Applying epoch versioning to inverted lists (IVF-AO-PQ) is planned future work.
     """)
 
     st.divider()
     st.subheader("Physical Memory Audit: Mode A vs. Mode B")
 
-    # Accurate memory accounting handling both small demo buffers and 1M scale
     if mem['total_records'] < 50000:
         mode_a_savings_str = "Overhead Dominated (Small Demo Buffer)"
     else:
